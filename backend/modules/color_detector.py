@@ -1,0 +1,221 @@
+"""
+Color Detection Module (HSV)
+
+Two functions:
+  detect_color(frame, bbox) → color name string
+      Used by analyzer for object+color queries.
+      Crops the bbox region, finds dominant color.
+
+  detect_color_full_frame(frame, target_color) → dict
+      Used by analyzer for color-only queries.
+      Checks if target color exists anywhere in the frame.
+
+Interface:
+    detect_color(frame, bbox)                → "red" | "blue" | None
+    detect_color_full_frame(frame, color)     → { detected, confidence, area_pct }
+"""
+
+import cv2
+import numpy as np
+
+
+# ============================================================
+# HSV COLOR RANGES
+# Red wraps around 0/180 in OpenCV HSV, so it has two ranges
+# ============================================================
+
+COLOR_RANGES = {
+    "red":    [(np.array([0, 100, 100]),   np.array([10, 255, 255])),
+               (np.array([170, 100, 100]), np.array([180, 255, 255]))],
+    "blue":   [(np.array([100, 100, 100]), np.array([130, 255, 255]))],
+    "green":  [(np.array([40, 100, 100]),  np.array([80, 255, 255]))],
+    "yellow": [(np.array([20, 100, 100]),  np.array([35, 255, 255]))],
+    "orange": [(np.array([10, 100, 100]),  np.array([20, 255, 255]))],
+    "purple": [(np.array([130, 100, 100]), np.array([160, 255, 255]))],
+    "pink":   [(np.array([160, 100, 100]), np.array([170, 255, 255]))],
+    "cyan":   [(np.array([80, 100, 100]),  np.array([100, 255, 255]))],
+    "white":  [(np.array([0, 0, 200]),     np.array([180, 30, 255]))],
+    "black":  [(np.array([0, 0, 0]),       np.array([180, 255, 50]))],
+    "gray":   [(np.array([0, 0, 80]),      np.array([180, 50, 200]))],
+    "grey":   [(np.array([0, 0, 80]),      np.array([180, 50, 200]))],
+    "brown":  [(np.array([10, 100, 50]),   np.array([20, 255, 150]))],
+    "maroon": [(np.array([0, 100, 50]),    np.array([10, 255, 150]))],
+    "navy":   [(np.array([100, 100, 50]),  np.array([130, 255, 150]))],
+    "teal":   [(np.array([80, 100, 80]),   np.array([100, 255, 200]))],
+    "golden": [(np.array([15, 100, 150]),  np.array([30, 255, 255]))],
+    "silver": [(np.array([0, 0, 150]),     np.array([180, 30, 220]))],
+    "beige":  [(np.array([15, 30, 180]),   np.array([30, 80, 255]))],
+    "violet": [(np.array([130, 100, 100]), np.array([160, 255, 255]))],
+    "magenta":[(np.array([150, 100, 100]), np.array([170, 255, 255]))],
+}
+
+
+def _hsv_to_color_name(h: int, s: int, v: int) -> str:
+    """
+    Convert a single HSV pixel to the closest color name.
+    Used to identify dominant color in a region.
+    """
+    # Low saturation → achromatic (black, white, gray)
+    if s < 40:
+        if v < 50:
+            return "black"
+        elif v > 200:
+            return "white"
+        else:
+            return "gray"
+
+    # Chromatic — classify by hue
+    if h < 5 or h > 170:
+        return "red"
+    elif 5 <= h < 15:
+        return "orange"
+    elif 15 <= h < 35:
+        return "yellow"
+    elif 35 <= h < 80:
+        return "green"
+    elif 80 <= h < 100:
+        return "cyan"
+    elif 100 <= h < 130:
+        return "blue"
+    elif 130 <= h < 160:
+        return "purple"
+    else:
+        return "pink"
+
+
+def detect_color(frame: np.ndarray, bbox: list | tuple) -> str | None:
+    """
+    Detect the dominant color inside a bounding box region.
+
+    Used for object+color queries:
+        YOLO finds "car" → crop bbox → detect_color tells you it's "red"
+
+    Args:
+        frame: full BGR image
+        bbox: [x1, y1, x2, y2] bounding box coordinates
+
+    Returns:
+        color name string ("red", "blue", etc.) or None on failure
+    """
+    try:
+        x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+
+        # Clamp to frame bounds
+        h, w = frame.shape[:2]
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(w, x2)
+        y2 = min(h, y2)
+
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        # Crop bbox region
+        region = frame[y1:y2, x1:x2]
+
+        # Convert to HSV
+        hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+
+        # Calculate mean HSV of the region
+        mean_h = int(np.mean(hsv[:, :, 0]))
+        mean_s = int(np.mean(hsv[:, :, 1]))
+        mean_v = int(np.mean(hsv[:, :, 2]))
+
+        return _hsv_to_color_name(mean_h, mean_s, mean_v)
+
+    except Exception:
+        return None
+
+
+def detect_color_full_frame(frame: np.ndarray, target_color: str, min_area_pct: float = 0.5) -> dict | None:
+    """
+    Check if a specific color exists anywhere in the full frame.
+
+    Used for color-only queries:
+        "Find red objects" → scan entire frame for red regions
+
+    Args:
+        frame: full BGR image
+        target_color: color name to search for ("red", "blue", etc.)
+        min_area_pct: minimum percentage of frame area to count as detected
+
+    Returns:
+        dict with detected, confidence, area_pct or None on failure
+    """
+    target = target_color.lower()
+
+    if target not in COLOR_RANGES:
+        return None
+
+    try:
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        # Build mask from all ranges for this color
+        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        for lower, upper in COLOR_RANGES[target]:
+            range_mask = cv2.inRange(hsv, lower, upper)
+            mask = cv2.bitwise_or(mask, range_mask)
+
+        # Clean up noise
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+        # Calculate area percentage
+        area_pct = (cv2.countNonZero(mask) / mask.size) * 100
+        detected = area_pct > min_area_pct
+        confidence = min(round(area_pct / 50, 3), 1.0)  # 50% area = 1.0 confidence
+
+        # Find bounding box of largest color region
+        bbox = None
+        if detected:
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                largest = max(contours, key=cv2.contourArea)
+                x, y, w, h = cv2.boundingRect(largest)
+                bbox = [x, y, x + w, y + h]
+
+        return {
+            "detected": detected,
+            "confidence": round(confidence, 3),
+            "area_pct": round(area_pct, 2),
+            "color": target,
+            "bbox": bbox,
+        }
+
+    except Exception:
+        return None
+
+
+# ============================================================
+# TEST
+# ============================================================
+
+if __name__ == "__main__":
+    # Create test frame with colored regions
+    frame = np.zeros((400, 600, 3), dtype=np.uint8)
+    frame[50:150, 50:150] = [0, 0, 255]     # Red (BGR)
+    frame[50:150, 200:300] = [0, 255, 0]     # Green (BGR)
+    frame[50:150, 350:450] = [255, 0, 0]     # Blue (BGR)
+    frame[200:300, 50:150] = [0, 255, 255]   # Yellow (BGR)
+    frame[200:300, 200:300] = [255, 255, 255] # White (BGR)
+
+    # Test detect_color with bbox (what color is in this region?)
+    print("--- detect_color (bbox → color name) ---")
+    print(f"Red region [50,50,150,150]:    {detect_color(frame, [50, 50, 150, 150])}")
+    print(f"Green region [200,50,300,150]: {detect_color(frame, [200, 50, 300, 150])}")
+    print(f"Blue region [350,50,450,150]:  {detect_color(frame, [350, 50, 450, 150])}")
+    print(f"Yellow region [50,200,150,300]:{detect_color(frame, [50, 200, 150, 300])}")
+    print(f"White region [200,200,300,300]:{detect_color(frame, [200, 200, 300, 300])}")
+    print(f"Black region [400,300,500,400]:{detect_color(frame, [400, 300, 500, 400])}")
+
+    # Test detect_color_full_frame (is red anywhere in the frame?)
+    print("\n--- detect_color_full_frame (is color in frame?) ---")
+    print(f"Red in frame:    {detect_color_full_frame(frame, 'red')}")
+    print(f"Green in frame:  {detect_color_full_frame(frame, 'green')}")
+    print(f"Purple in frame: {detect_color_full_frame(frame, 'purple')}")
+
+    # Test invalid inputs
+    print("\n--- Edge cases ---")
+    print(f"Invalid bbox:  {detect_color(frame, [0, 0, 0, 0])}")
+    print(f"Unknown color: {detect_color_full_frame(frame, 'magentaish')}")

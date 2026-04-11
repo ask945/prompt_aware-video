@@ -1,0 +1,28 @@
+# Framework
+fastapi
+uvicorn
+python-dotenv
+python-multipart
+
+# Database
+sqlalchemy
+psycopg2-binary
+
+# Cloud storage
+cloudinary
+
+# NLP
+spacy
+
+# Video processing
+opencv-python-headless
+
+# Object detection
+ultralytics
+
+# OCR
+pytesseract
+
+# HTTP (for downloading videos from Cloudinary)
+requests
+aiofiles
