@@ -27,11 +27,18 @@ export default function DetectionCard({ detection, index, onClick }) {
         </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center justify-between gap-2">
-            <h4 className="text-sm font-semibold text-text truncate">{detection.label}</h4>
+            <h4 className="text-sm font-semibold text-text truncate">
+              {detection.text_content ? 'Text Found' : detection.label}
+            </h4>
             <span className={`text-xs font-bold px-2 py-0.5 rounded-full flex-shrink-0 ${confidenceColor(detection.confidence)}`}>
               {conf}%
             </span>
           </div>
+          {detection.text_content && (
+            <p className="mt-1.5 text-xs text-text bg-bg rounded-lg px-3 py-2 font-mono leading-relaxed line-clamp-3">
+              {detection.text_content}
+            </p>
+          )}
           <div className="flex items-center gap-3 mt-1.5 text-xs text-text-secondary">
             <span className="flex items-center gap-1">
               <Clock className="w-3 h-3" />
@@ -39,7 +46,7 @@ export default function DetectionCard({ detection, index, onClick }) {
             </span>
             <span className="flex items-center gap-1">
               <Target className="w-3 h-3" />
-              Frame {detection.frame}
+              Frame {detection.frame_number}
             </span>
           </div>
         </div>

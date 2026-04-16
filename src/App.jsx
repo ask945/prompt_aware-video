@@ -109,7 +109,7 @@ export default function App() {
             setDetections(
               (data.detections || []).map((d, i) => ({
                 id: `det-${i}`,
-                label: d.object_class || d.text_content || 'Detection',
+                label: d.text_content || d.object_class || 'Detection',
                 confidence: d.confidence || 0,
                 timestamp: d.timestamp || 0,
                 timestamp_fmt: d.timestamp_fmt || '',

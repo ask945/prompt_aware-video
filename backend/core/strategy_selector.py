@@ -37,7 +37,7 @@ INTENT_TO_MODULES = {
 SCOPE_TO_SAMPLING = {
     "full":     "uniform",
     "specific": "direct_seek",
-    "search":   "binary_search",
+    "search":   "coarse_to_fine",
 }
 
 # ============================================================
@@ -116,7 +116,7 @@ def select(intent: str, temporal_scope: str) -> dict:
 
     Returns:
         dict with keys:
-            strategy             — sampling method (uniform / direct_seek / binary_search)
+            strategy             — sampling method (uniform / direct_seek / coarse_to_fine)
             modules              — list of CV modules to activate
             sample_rate          — frames per second to process
             early_stop           — whether to stop on confident result
@@ -165,14 +165,14 @@ if __name__ == "__main__":
         # (intent, temporal_scope, expected_strategy, expected_modules, expected_early_stop)
         ("object",       "full",     "uniform",       ["yolo"],              True),
         ("object",       "specific", "direct_seek",   ["yolo"],              False),
-        ("object",       "search",   "binary_search", ["yolo"],              True),
+        ("object",       "search",   "coarse_to_fine", ["yolo"],              True),
 
         ("color",        "full",     "uniform",       ["hsv"],               True),
         ("color",        "specific", "direct_seek",   ["hsv"],               False),
 
         ("object_color", "full",     "uniform",       ["yolo", "hsv"],       True),
         ("object_color", "specific", "direct_seek",   ["yolo", "hsv"],       False),
-        ("object_color", "search",   "binary_search", ["yolo", "hsv"],       True),
+        ("object_color", "search",   "coarse_to_fine", ["yolo", "hsv"],       True),
 
         ("ocr",          "full",     "uniform",       ["ocr"],               True),
         ("ocr",          "specific", "direct_seek",   ["ocr"],               False),
@@ -181,7 +181,7 @@ if __name__ == "__main__":
         ("counting",     "specific", "direct_seek",   ["yolo", "counter"],   False),
 
         ("event",        "full",     "uniform",       ["motion", "yolo"],    True),
-        ("event",        "search",   "binary_search", ["motion", "yolo"],    True),
+        ("event",        "search",   "coarse_to_fine", ["motion", "yolo"],    True),
 
         ("scene",        "full",     "uniform",       ["yolo", "hsv"],       False),
     ]

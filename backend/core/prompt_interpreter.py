@@ -3,56 +3,69 @@ import spacy
 
 nlp = spacy.load("en_core_web_sm")
 
+# ============================================================
+# INTENT RULES
+# Keywords here use LEMMA form — matched against token.lemma_
+# so "falls", "falling", "fell" all match lemma "fall"
+# Multi-word phrases are still matched against raw query string
+# ============================================================
+
+# Lemma-based keywords (single words — matched via spaCy lemma)
+EVENT_LEMMAS = {
+    "fall", "enter", "leave", "run", "jump", "sit", "stand",
+    "fight", "crash", "stop", "cross", "climb", "push", "pull",
+    "kick", "throw", "hit", "drop", "slip", "trip", "collide",
+    "arrive", "depart", "open", "close",
+    "break", "explode", "catch", "grab", "pick", "place", "walk",
+    "move", "turn", "spin", "flip", "slide", "roll", "bounce",
+    "lift", "carry", "drag", "swing",
+    # NOTE: "appear"/"disappear" intentionally excluded —
+    # they indicate temporal search scope, not action events
+}
+
 INTENT_RULES = {
     "event": {
-        "keywords": [
-            "fall", "falls", "falling", "fell",
-            "enter", "enters", "entering", "entered",
-            "leave", "leaves", "leaving", "left",
-            "run", "runs", "running", "ran",
-            "jump", "jumps", "jumping", "jumped",
-            "sit", "sits", "sitting", "sat",
-            "stand", "stands", "standing", "stood",
-            "fight", "fights", "fighting",
-            "crash", "crashes", "crashing",
-            "stop", "stops", "stopping", "stopped",
-            "cross", "crosses", "crossing",
-        ],
+        "keywords": [],  # handled via lemma matching below
+        "phrases": [],   # multi-word phrases matched against raw query
         "priority": 8,
     },
     "counting": {
-        "keywords": [
+        "keywords": [],
+        "phrases": [
             "how many", "count", "number of", "total number",
             "how much", "quantity",
         ],
         "priority": 7,
     },
     "ocr": {
-        "keywords": [
-            "text", "written", "read", "writing", "says",
-            "sign", "board", "screen", "display", "letter",
-            "word", "ocr", "extract text", "what does it say",
+        "keywords": ["ocr"],
+        "phrases": [
+            "extract text", "what does it say",
             "what is written", "what text",
         ],
+        "lemmas": {"write", "read"},
+        "nouns": {"text", "sign", "board", "display", "letter", "word", "writing"},
         "priority": 6,
     },
     "scene": {
-        "keywords": [
-            "describe", "summary", "summarize",
+        "keywords": [],
+        "phrases": [
             "what is happening", "what's happening",
-            "scene", "overview", "what do you see",
-            "tell me about", "explain the video",
-            "what is going on", "what's going on",
-            "describe the video",
+            "what do you see", "tell me about",
+            "explain the video", "what is going on",
+            "what's going on", "describe the video",
         ],
+        "lemmas": {"describe", "summarize", "explain", "overview"},
+        "nouns": {"scene", "summary", "overview"},
         "priority": 5,
     },
     "object": {
-        "keywords": [
-            "is there", "find", "detect", "show", "search",
-            "look for", "locate", "spot", "identify",
-            "any", "can you see", "do you see", "where is",
+        "keywords": [],
+        "phrases": [
+            "is there", "look for", "can you see",
+            "do you see", "where is",
         ],
+        "lemmas": {"find", "detect", "search", "locate", "spot", "identify", "show"},
         "priority": 2,
     },
     # "object_color" and "color" resolved dynamically
@@ -111,6 +124,7 @@ TARGET_ALIASES = {
     "child": "person", "kid": "person", "baby": "person",
     "vehicle": "car", "phone": "cell phone", "mobile": "cell phone",
     "sofa": "couch", "monitor": "tv", "screen": "tv",
+    "ball": "sports ball",
 }
 
 # Nouns to ignore — not visual targets
@@ -119,6 +133,8 @@ IGNORE_NOUNS = {
     "clip", "footage", "recording", "part", "section",
     "number", "amount", "total", "sum", "count",
     "type", "kind", "sort", "group", "lot", "bunch",
+    "object", "thing", "stuff", "item", "something", "anything",
+    "one", "ones", "everything", "anyone", "someone",
 }
 
 
@@ -175,6 +191,11 @@ def extract_color(doc) -> str | None:
     return None
 
 
+def _is_ignored(token) -> bool:
+    """Check if a token should be ignored as a target (by text or lemma)."""
+    return token.text.lower() in IGNORE_NOUNS or token.lemma_ in IGNORE_NOUNS
+
+
 def extract_target(doc) -> str | None:
     """
     Extract target object using 3-layer strategy:
@@ -187,7 +208,7 @@ def extract_target(doc) -> str | None:
     # Layer 1: Direct YOLO class match
     for token in doc:
         word = token.text.lower()
-        if word in YOLO_CLASSES and word not in COLORS and word not in IGNORE_NOUNS:
+        if word in YOLO_CLASSES and word not in COLORS and not _is_ignored(token):
             target = word
             break
 
@@ -195,18 +216,16 @@ def extract_target(doc) -> str | None:
     if not target:
         for token in doc:
             if token.dep_ in ("dobj", "pobj", "nsubj", "attr") and token.pos_ in ("NOUN", "PROPN"):
-                word = token.text.lower()
-                if word not in COLORS and word not in IGNORE_NOUNS:
-                    target = word
+                if not _is_ignored(token) and token.text.lower() not in COLORS:
+                    target = token.text.lower()
                     break
 
     # Layer 3: Any noun fallback
     if not target:
         for token in doc:
             if token.pos_ == "NOUN":
-                word = token.text.lower()
-                if word not in COLORS and word not in IGNORE_NOUNS:
-                    target = word
+                if not _is_ignored(token) and token.text.lower() not in COLORS:
+                    target = token.text.lower()
                     break
 
     # Normalize aliases
@@ -216,19 +235,60 @@ def extract_target(doc) -> str | None:
     return target
 
 
-def classify_intent(query_lower: str, target: str | None, color: str | None) -> str:
+def classify_intent(query_lower: str, doc, target: str | None, color: str | None) -> str:
     """
     Classify WHAT to analyze.
-    Based on keywords + extracted entities.
+    Uses 4 matching strategies in order:
+      1. Multi-word phrase match against raw query
+      2. Lemma match against spaCy tokens
+      3. Intent-specific noun match
+      4. Verb POS fallback for event detection
     Does NOT consider temporal scope — that's a separate axis.
     """
+    # Collect lemmas and nouns from spaCy doc
+    doc_lemmas = {token.lemma_ for token in doc}
+    doc_nouns = {token.text.lower() for token in doc if token.pos_ == "NOUN"}
+    doc_verbs = {token.lemma_ for token in doc if token.pos_ == "VERB"}
+
     scored = []
 
     for intent_name, rule in INTENT_RULES.items():
-        for keyword in rule["keywords"]:
-            if keyword in query_lower:
-                scored.append((intent_name, rule["priority"]))
+        matched = False
+
+        # Strategy 1: exact keyword match in raw query
+        for kw in rule.get("keywords", []):
+            if kw in query_lower:
+                matched = True
                 break
+
+        # Strategy 2: multi-word phrase match in raw query
+        if not matched:
+            for phrase in rule.get("phrases", []):
+                if phrase in query_lower:
+                    matched = True
+                    break
+
+        # Strategy 3: lemma match (covers all tenses automatically)
+        if not matched:
+            rule_lemmas = rule.get("lemmas", set())
+            if rule_lemmas & doc_lemmas:
+                matched = True
+
+        # Strategy 4: intent-specific noun match
+        if not matched:
+            rule_nouns = rule.get("nouns", set())
+            if rule_nouns & doc_nouns:
+                matched = True
+
+        if matched:
+            scored.append((intent_name, rule["priority"]))
+
+    # Strategy 5: event lemma fallback
+    # Check ALL token lemmas (not just POS=VERB) because spaCy small model
+    # sometimes tags action words as NOUN (e.g. "bounce" in "does the ball bounce?")
+    if not any(s[0] == "event" for s in scored):
+        if doc_lemmas & EVENT_LEMMAS:
+            scored.append(("event", INTENT_RULES["event"]["priority"]))
 
     scored.sort(key=lambda x: x[1], reverse=True)
 
@@ -239,9 +299,14 @@ def classify_intent(query_lower: str, target: str | None, color: str | None) -> 
         if best == "object" and color and target:
             return "object_color"
 
+        # Downgrade object → color if color exists but no concrete target
+        # e.g. "Find red objects" → target is None (generic noun), color is "red"
+        if best == "object" and color and not target:
+            return "color"
+
         return best
 
-    # No keyword match — resolve from entities
+    # No match at all — resolve from entities
     if color and target:
         return "object_color"
     if color and not target:
@@ -260,8 +325,8 @@ def calculate_confidence(intent: str, temporal_scope: str, target: str | None, c
         return 0.90 if temporal_scope == "full" else 0.95
     if intent == "counting" and target:
         return 0.90
-    if intent == "event" and target:
-        return 0.85
+    if intent == "event":
+        return 0.85 if target else 0.75
     if intent == "color" and color:
         return 0.85
     if intent in ("ocr", "scene"):
@@ -296,7 +361,7 @@ def parse(query: str) -> dict:
     timestamp = extract_timestamp(query_lower)
 
     # Axis 1: WHAT to analyze (independent of scope)
-    intent = classify_intent(query_lower, target, color)
+    intent = classify_intent(query_lower, doc, target, color)
 
     # Axis 2: HOW to traverse (independent of intent)
     temporal_scope = extract_temporal_scope(query_lower, timestamp)
@@ -335,6 +400,8 @@ if __name__ == "__main__":
         ("Is there a red car?",                "object_color", "full"),
         ("Is there a red car at 1:45?",        "object_color", "specific"),
         ("When does the red car first appear?","object_color", "search"),
+        ("when does white car appear first?",  "object_color", "search"),
+        ("when does red car appear?",          "object_color", "search"),
 
         # Same intent (counting), different scopes
         ("How many people are there?",         "counting",     "full"),
@@ -343,6 +410,12 @@ if __name__ == "__main__":
         # Same intent (event), different scopes
         ("Does anyone fall?",                  "event",        "full"),
         ("When does a person fall?",           "event",        "search"),
+
+        # Lemma-based event detection (no exact keyword match needed)
+        ("When does the ball bounce?",         "event",        "search"),
+        ("Does anyone climb the wall?",        "event",        "full"),
+        ("The person slipped",                 "event",        "full"),
+        ("When did the car explode?",          "event",        "search"),
 
         # Other intents
         ("Find red objects",                   "color",        "full"),

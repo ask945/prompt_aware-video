@@ -20,8 +20,8 @@ opencv-python-headless
 # Object detection
 ultralytics
 
-# OCR
-pytesseract
+# OCR (pure Python — no system binary needed)
+easyocr
 
 # HTTP (for downloading videos from Cloudinary)
 requests

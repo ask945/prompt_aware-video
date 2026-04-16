@@ -14,7 +14,6 @@ env_path = Path(__file__).resolve().parent.parent / ".env.local"
 load_dotenv(env_path)
 
 from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import cloudinary
 from config import settings
@@ -44,10 +43,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Serve saved detection frames as static files
-# Frontend accesses: /api/frames/frame_450.jpg
-app.mount("/api/frames", StaticFiles(directory=str(settings.FRAMES_DIR)), name="frames")
 
 app.include_router(upload_router)
 app.include_router(analyze_router)

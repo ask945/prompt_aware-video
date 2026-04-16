@@ -24,6 +24,41 @@ import numpy as np
 # Red wraps around 0/180 in OpenCV HSV, so it has two ranges
 # ============================================================
 
+# ============================================================
+# SIMILAR COLORS — for fuzzy matching in real-world video
+# "white" in CCTV often looks "gray", "silver" looks "white", etc.
+# ============================================================
+
+SIMILAR_COLORS = {
+    "white":  {"white", "gray", "grey", "silver"},
+    "gray":   {"gray", "grey", "white", "silver"},
+    "grey":   {"gray", "grey", "white", "silver"},
+    "silver": {"silver", "gray", "grey", "white"},
+    "black":  {"black"},
+    "red":    {"red", "maroon"},
+    "maroon": {"maroon", "red"},
+    "blue":   {"blue", "navy"},
+    "navy":   {"navy", "blue"},
+    "green":  {"green", "teal"},
+    "teal":   {"teal", "green", "cyan"},
+    "orange": {"orange", "yellow"},
+    "yellow": {"yellow", "orange", "golden"},
+    "golden": {"golden", "yellow", "orange"},
+    "pink":   {"pink", "magenta"},
+    "magenta":{"magenta", "pink"},
+    "purple": {"purple", "violet"},
+    "violet": {"violet", "purple"},
+}
+
+
+def is_color_match(detected: str, wanted: str) -> bool:
+    """Check if detected color matches wanted color (with fuzzy similarity)."""
+    if detected == wanted:
+        return True
+    similar = SIMILAR_COLORS.get(wanted, {wanted})
+    return detected in similar
+
+
 COLOR_RANGES = {
     "red":    [(np.array([0, 100, 100]),   np.array([10, 255, 255])),
                (np.array([170, 100, 100]), np.array([180, 255, 255]))],
@@ -34,10 +69,10 @@ COLOR_RANGES = {
     "purple": [(np.array([130, 100, 100]), np.array([160, 255, 255]))],
     "pink":   [(np.array([160, 100, 100]), np.array([170, 255, 255]))],
     "cyan":   [(np.array([80, 100, 100]),  np.array([100, 255, 255]))],
-    "white":  [(np.array([0, 0, 200]),     np.array([180, 30, 255]))],
-    "black":  [(np.array([0, 0, 0]),       np.array([180, 255, 50]))],
-    "gray":   [(np.array([0, 0, 80]),      np.array([180, 50, 200]))],
-    "grey":   [(np.array([0, 0, 80]),      np.array([180, 50, 200]))],
+    "white":  [(np.array([0, 0, 140]),     np.array([180, 50, 255]))],
+    "black":  [(np.array([0, 0, 0]),       np.array([180, 255, 40]))],
+    "gray":   [(np.array([0, 0, 60]),      np.array([180, 50, 160]))],
+    "grey":   [(np.array([0, 0, 60]),      np.array([180, 50, 160]))],
     "brown":  [(np.array([10, 100, 50]),   np.array([20, 255, 150]))],
     "maroon": [(np.array([0, 100, 50]),    np.array([10, 255, 150]))],
     "navy":   [(np.array([100, 100, 50]),  np.array([130, 255, 150]))],
@@ -54,15 +89,25 @@ def _hsv_to_color_name(h: int, s: int, v: int) -> str:
     """
     Convert a single HSV pixel to the closest color name.
     Used to identify dominant color in a region.
+
+    Tuned for real-world video (CCTV, outdoor, compressed footage)
+    where "white" objects rarely hit pure V=255.
     """
     # Low saturation → achromatic (black, white, gray)
-    if s < 40:
-        if v < 50:
+    if s < 50:
+        if v < 40:
             return "black"
-        elif v > 200:
+        elif v > 140:
             return "white"
+        elif v < 90:
+            return "black"
         else:
             return "gray"
+
+    # Medium-low saturation + high value → still white-ish
+    # Catches slightly tinted whites (common in video compression)
+    if s < 80 and v > 170:
+        return "white"
 
     # Chromatic — classify by hue
     if h < 5 or h > 170:
@@ -83,19 +128,12 @@ def _hsv_to_color_name(h: int, s: int, v: int) -> str:
         return "pink"
 
 
-def detect_color(frame: np.ndarray, bbox: list | tuple) -> str | None:
+def _get_color_votes(frame: np.ndarray, bbox: list | tuple) -> dict:
     """
-    Detect the dominant color inside a bounding box region.
+    Internal helper. Crops center 60% of bbox, downsamples, classifies
+    every pixel by HSV, returns {color_name: pixel_count} dict.
 
-    Used for object+color queries:
-        YOLO finds "car" → crop bbox → detect_color tells you it's "red"
-
-    Args:
-        frame: full BGR image
-        bbox: [x1, y1, x2, y2] bounding box coordinates
-
-    Returns:
-        color name string ("red", "blue", etc.) or None on failure
+    Returns empty dict on failure.
     """
     try:
         x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
@@ -108,23 +146,60 @@ def detect_color(frame: np.ndarray, bbox: list | tuple) -> str | None:
         y2 = min(h, y2)
 
         if x2 <= x1 or y2 <= y1:
-            return None
+            return {}
 
-        # Crop bbox region
-        region = frame[y1:y2, x1:x2]
+        # Shrink to center 60% to avoid edges (tires, shadows, background)
+        bw, bh = x2 - x1, y2 - y1
+        margin_x, margin_y = int(bw * 0.2), int(bh * 0.2)
+        cx1 = x1 + margin_x
+        cy1 = y1 + margin_y
+        cx2 = x2 - margin_x
+        cy2 = y2 - margin_y
 
-        # Convert to HSV
+        if cx2 <= cx1 or cy2 <= cy1:
+            cx1, cy1, cx2, cy2 = x1, y1, x2, y2
+
+        region = frame[cy1:cy2, cx1:cx2]
+
+        # Downsample to max 50x50 for speed
+        rh, rw = region.shape[:2]
+        if rh > 50 or rw > 50:
+            region = cv2.resize(region, (min(rw, 50), min(rh, 50)))
+
         hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
 
-        # Calculate mean HSV of the region
-        mean_h = int(np.mean(hsv[:, :, 0]))
-        mean_s = int(np.mean(hsv[:, :, 1]))
-        mean_v = int(np.mean(hsv[:, :, 2]))
+        pixels = hsv.reshape(-1, 3)
+        votes = {}
+        for px in pixels:
+            color_name = _hsv_to_color_name(int(px[0]), int(px[1]), int(px[2]))
+            votes[color_name] = votes.get(color_name, 0) + 1
 
-        return _hsv_to_color_name(mean_h, mean_s, mean_v)
+        return votes
 
     except Exception:
+        return {}
+
+
+def detect_color(frame: np.ndarray, bbox: list | tuple) -> str | None:
+    """
+    Detect the dominant color inside a bounding box region.
+    Returns the single most common color name, or None on failure.
+    """
+    votes = _get_color_votes(frame, bbox)
+    if not votes:
         return None
+    return max(votes, key=votes.get)
+
+
+def detect_color_top_n(frame: np.ndarray, bbox: list | tuple, n: int = 2) -> list[str]:
+    """
+    Return the top-N dominant colors inside a bounding box.
+    Sorted by pixel count descending. Empty list on failure.
+    """
+    votes = _get_color_votes(frame, bbox)
+    if not votes:
+        return []
+    return sorted(votes, key=votes.get, reverse=True)[:n]
 
 
 def detect_color_full_frame(frame: np.ndarray, target_color: str, min_area_pct: float = 0.5) -> dict | None:

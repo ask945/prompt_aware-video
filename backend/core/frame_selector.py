@@ -323,6 +323,160 @@ def sample_binary_search(video_path: str, detect_fn, max_iterations: int = 20) -
 
 
 # ============================================================
+# SAMPLING METHOD 5: COARSE-TO-FINE
+# Two-pass approach: scan broadly first, then densely sample
+# only the candidate regions where the target was found.
+# Replaces binary_search for "search" scope queries.
+# ============================================================
+
+import logging as _logging
+_ctf_logger = _logging.getLogger(__name__)
+
+
+def sample_coarse_to_fine(
+    video_path: str,
+    detect_fn,
+    coarse_rate: float = 0.3,
+    fine_rate: float = 2.0,
+    region_padding: float = 2.0,
+    retry_rate: float = 1.0,
+) -> list:
+    """
+    Coarse-to-fine sampling — find candidate regions then sample them densely.
+
+    Pass 1 (coarse): sample every ~3 seconds, run detect_fn on each frame.
+    Pass 2 (fine):   densely sample only the candidate regions at fine_rate fps.
+
+    Args:
+        video_path:      path to video file
+        detect_fn:       callback function(frame) -> bool (lightweight, e.g. YOLO only)
+        coarse_rate:     fps for pass 1 (default 0.3 = 1 frame per ~3 seconds)
+        fine_rate:       fps for pass 2 around candidate regions (default 2.0)
+        region_padding:  seconds of padding around each hit (default 2.0)
+        retry_rate:      fps for retry pass if coarse finds nothing (default 1.0)
+
+    Returns:
+        list of {frame, frame_number, timestamp} from the fine pass
+    """
+    cap, meta = open_video(video_path)
+    fps = meta["fps"]
+    total = meta["total_frames"]
+    duration = meta["duration"]
+    cap.release()
+
+    # ── Pass 1: Coarse scan ──
+    hit_frames = _coarse_scan(video_path, fps, total, detect_fn, coarse_rate)
+    _ctf_logger.info(
+        f"Coarse pass ({coarse_rate} fps): {len(hit_frames)} hits "
+        f"from {max(1, int(duration * coarse_rate))} frames checked"
+    )
+
+    # ── Retry at higher rate if coarse found nothing ──
+    if not hit_frames and retry_rate > coarse_rate:
+        _ctf_logger.info(f"Retrying coarse scan at {retry_rate} fps")
+        hit_frames = _coarse_scan(video_path, fps, total, detect_fn, retry_rate)
+        _ctf_logger.info(f"Retry pass: {len(hit_frames)} hits")
+
+    if not hit_frames:
+        _ctf_logger.info("No candidate regions found after retry")
+        return []
+
+    # ── Merge hits into regions ──
+    regions = _merge_hits_into_regions(hit_frames, fps, region_padding, duration)
+    _ctf_logger.info(f"Merged into {len(regions)} candidate region(s): {regions}")
+
+    # ── Pass 2: Fine sample within candidate regions ──
+    selected = _fine_sample(video_path, fps, total, regions, fine_rate)
+    _ctf_logger.info(f"Fine pass: {len(selected)} frames from {len(regions)} region(s)")
+
+    return selected
+
+
+def _coarse_scan(video_path, fps, total, detect_fn, rate):
+    """Run detect_fn at given rate, return list of frame numbers that hit."""
+    interval = max(1, int(fps / rate))
+    hits = []
+
+    cap = cv2.VideoCapture(video_path)
+    frame_number = 0
+
+    while frame_number < total:
+        ret, frame = read_frame_at(cap, frame_number)
+        if not ret:
+            frame_number += interval
+            continue
+
+        if detect_fn(frame):
+            hits.append(frame_number)
+
+        frame_number += interval
+
+    cap.release()
+    return hits
+
+
+def _merge_hits_into_regions(hit_frames, fps, padding_sec, duration):
+    """
+    Convert hit frame numbers into merged time regions.
+    Each hit expands to [hit_time - padding, hit_time + padding].
+    Overlapping regions are merged.
+
+    Returns: list of (start_sec, end_sec) tuples
+    """
+    if not hit_frames:
+        return []
+
+    # Convert to time ranges
+    raw_regions = []
+    for fn in sorted(hit_frames):
+        t = fn / fps
+        start = max(0, t - padding_sec)
+        end = min(duration, t + padding_sec)
+        raw_regions.append((start, end))
+
+    # Merge overlapping
+    merged = [raw_regions[0]]
+    for start, end in raw_regions[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+
+    return merged
+
+
+def _fine_sample(video_path, fps, total, regions, fine_rate):
+    """Densely sample within each region at fine_rate fps."""
+    interval = max(1, int(fps / fine_rate))
+    selected = []
+    seen = set()
+
+    cap = cv2.VideoCapture(video_path)
+
+    for start_sec, end_sec in regions:
+        start_frame = max(0, int(start_sec * fps))
+        end_frame = min(total - 1, int(end_sec * fps))
+
+        frame_number = start_frame
+        while frame_number <= end_frame:
+            if frame_number not in seen:
+                ret, frame = read_frame_at(cap, frame_number)
+                if ret:
+                    selected.append({
+                        "frame": frame,
+                        "frame_number": frame_number,
+                        "timestamp": frame_number / fps,
+                    })
+                    seen.add(frame_number)
+            frame_number += interval
+
+    cap.release()
+    selected.sort(key=lambda x: x["frame_number"])
+    return selected
+
+
+# ============================================================
 # MAIN SAMPLE FUNCTION — ENTRY POINT
 # ============================================================
 
@@ -352,6 +506,11 @@ def sample(video_path: str, strategy_config: dict, detect_fn=None) -> list:
         if timestamp is None:
             raise ValueError("direct_seek strategy requires a timestamp")
         return sample_direct_seek(video_path, timestamp)
+
+    elif strategy == "coarse_to_fine":
+        if detect_fn is None:
+            raise ValueError("coarse_to_fine strategy requires a detect_fn callback")
+        return sample_coarse_to_fine(video_path, detect_fn)
 
     elif strategy == "binary_search":
         if detect_fn is None:

@@ -13,11 +13,11 @@ from datetime import datetime
 
 from core.frame_selector import sample, get_sampling_stats
 from modules.yolo_detector import detect
-from modules.color_detector import detect_color, detect_color_full_frame
-from modules.ocr_extractor import extract_text
+from modules.color_detector import detect_color, detect_color_top_n, detect_color_full_frame, is_color_match
+from modules.ocr_extractor import extract_text, extract_text_regions
 from modules.motion_detector import detect_motion
 from modules.counter import count
-from utils.video_utils import download_from_cloudinary, save_frame, cleanup_temp
+from utils.video_utils import download_from_cloudinary, cleanup_temp
 from utils.helpers import format_timestamp
 from database.db import SessionLocal
 from database.schemas import Job, Detection
@@ -56,28 +56,28 @@ def _complete_job(job_id: str, found: bool, confidence: float, detections: list,
             return
 
         job.status = "complete"
-        job.result_found = found
-        job.confidence = confidence
-        job.time_taken = stats.get("time_taken")
-        job.total_frames = stats.get("total_frames")
-        job.frames_processed = stats.get("frames_processed")
+        job.result_found = bool(found)
+        job.confidence = float(confidence)
+        job.time_taken = float(stats.get("time_taken") or 0)
+        job.total_frames = int(stats.get("total_frames") or 0)
+        job.frames_processed = int(stats.get("frames_processed") or 0)
         job.completed_at = datetime.utcnow()
 
         for d in detections:
             bbox = d.get("bbox")
             det = Detection(
                 job_id=job_id,
-                frame_number=d["frame_number"],
-                timestamp=d["timestamp"],
+                frame_number=int(d["frame_number"]),
+                timestamp=float(d["timestamp"]),
                 timestamp_fmt=d["timestamp_fmt"],
                 object_class=d.get("object_class"),
                 color=d.get("color"),
-                confidence=d["confidence"],
-                bbox_x1=bbox[0] if bbox else None,
-                bbox_y1=bbox[1] if bbox else None,
-                bbox_x2=bbox[2] if bbox else None,
-                bbox_y2=bbox[3] if bbox else None,
-                frame_url=d.get("frame_image"),
+                confidence=float(d["confidence"]),
+                bbox_x1=int(bbox[0]) if bbox else None,
+                bbox_y1=int(bbox[1]) if bbox else None,
+                bbox_x2=int(bbox[2]) if bbox else None,
+                bbox_y2=int(bbox[3]) if bbox else None,
+                frame_url=None,
                 text_content=d.get("text_content"),
             )
             db.add(det)
@@ -136,11 +136,29 @@ def run_analysis(job_id: str, video_url: str, query_data: dict, strategy_config:
         # ─── Step 2: Prepare config ───
         strategy_config["timestamp"] = query_data.get("timestamp")
 
-        # ─── Step 3: Prepare detect_fn for binary search ───
+        # ─── Step 3: Prepare detect_fn for coarse-to-fine / binary search ───
         detect_fn = None
-        if strategy_config["strategy"] == "binary_search":
+        if strategy_config["strategy"] in ("coarse_to_fine", "binary_search"):
             target = query_data.get("target")
-            detect_fn = lambda frame: len(detect(frame, target)) > 0
+            attribute = query_data.get("attribute")
+            low_conf = 0.3
+
+            if attribute and "hsv" in strategy_config["modules"]:
+                # Coarse pass with lightweight color pre-filter:
+                # YOLO finds objects, then quick color check narrows candidates.
+                # Uses is_color_match (fuzzy) so it's lenient but still filters
+                # out obviously wrong colors (e.g. white car when looking for red).
+                def detect_fn(frame):
+                    results = detect(frame, target, confidence=low_conf)
+                    if not results:
+                        return False
+                    for r in results:
+                        color = detect_color(frame, r["bbox"])
+                        if is_color_match(color, attribute):
+                            return True
+                    return False
+            else:
+                detect_fn = lambda frame: len(detect(frame, target, confidence=low_conf)) > 0
 
         # ─── Step 4: Sample frames ───
         logger.info(f"Job {job_id}: sampling frames with strategy={strategy_config['strategy']}")
@@ -153,6 +171,22 @@ def run_analysis(job_id: str, video_url: str, query_data: dict, strategy_config:
         stats = get_sampling_stats(local_path, selected_frames)
         total_selected = len(selected_frames)
         logger.info(f"Job {job_id}: selected {total_selected} of {stats['total_frames']} frames")
+
+        # ─── Step 4b: Fallback to uniform if search found nothing ───
+        if total_selected == 0 and strategy_config["strategy"] in ("coarse_to_fine", "binary_search"):
+            logger.info(
+                f"Job {job_id}: {strategy_config['strategy']} found no candidate regions, "
+                f"falling back to uniform sampling"
+            )
+            fallback_config = {**strategy_config, "strategy": "uniform", "sample_rate": 1}
+            selected_frames = sample(
+                video_path=local_path,
+                strategy_config=fallback_config,
+                detect_fn=None,
+            )
+            stats = get_sampling_stats(local_path, selected_frames)
+            total_selected = len(selected_frames)
+            logger.info(f"Job {job_id}: uniform fallback selected {total_selected} of {stats['total_frames']} frames")
 
         _update_progress(
             job_id,
@@ -182,15 +216,20 @@ def run_analysis(job_id: str, video_url: str, query_data: dict, strategy_config:
             frames_analyzed += 1
 
             if result:
-                result["frame_image"] = save_frame(frame, frame_num)
-                detections.append(result)
+                # OCR returns a list of regions; everything else returns a dict
+                if isinstance(result, list):
+                    detections.extend(result)
+                    best_conf = max(r["confidence"] for r in result)
+                else:
+                    detections.append(result)
+                    best_conf = result["confidence"]
 
                 # ─── Step 6: Early termination ───
                 if strategy_config["early_stop"]:
-                    if result["confidence"] >= strategy_config["confidence_threshold"]:
+                    if best_conf >= strategy_config["confidence_threshold"]:
                         logger.info(
                             f"Job {job_id}: early stop at frame {frame_num} "
-                            f"(conf={result['confidence']})"
+                            f"(conf={best_conf})"
                         )
                         break
 
@@ -205,7 +244,11 @@ def run_analysis(job_id: str, video_url: str, query_data: dict, strategy_config:
                     frames_processed=frames_analyzed,
                 )
 
-        # ─── Step 7: Build stats ───
+        # ─── Step 7: Filter out low-confidence soft-scored detections ───
+        MIN_RESULT_CONFIDENCE = 0.35
+        detections = [d for d in detections if d["confidence"] >= MIN_RESULT_CONFIDENCE]
+
+        # ─── Step 8: Build stats ───
         total_time = round(time.time() - start_time, 2)
 
         best_confidence = 0.0
@@ -265,12 +308,22 @@ def _analyze_single_frame(frame, prev_frame, frame_num, timestamp, query_data, m
 
         best = max(results, key=lambda d: d["confidence"])
 
-        # Color check on detected object
+        # Soft color scoring — never discard, just penalize confidence
         if "hsv" in modules and attribute:
-            color = detect_color(frame, best["bbox"])
-            if color != attribute:
-                return None
-            best["color"] = color
+            dominant_color = detect_color(frame, best["bbox"])
+            top_colors = detect_color_top_n(frame, best["bbox"], n=2)
+
+            if is_color_match(dominant_color, attribute):
+                # Exact match on dominant color — full confidence
+                best["color"] = dominant_color
+            elif attribute in top_colors or any(is_color_match(c, attribute) for c in top_colors):
+                # Wanted color is in top-2 — reduce confidence by 20%
+                best["color"] = attribute
+                best["confidence"] *= 0.8
+            else:
+                # Color mismatch — heavy penalty but still return detection
+                best["color"] = dominant_color
+                best["confidence"] *= 0.3
 
         # Count objects
         if "counter" in modules:
@@ -305,21 +358,24 @@ def _analyze_single_frame(frame, prev_frame, frame_num, timestamp, query_data, m
             }
         return None
 
-    # ── OCR only ──
+    # ── OCR — return each text region as a separate detection ──
     if "ocr" in modules:
-        text = extract_text(frame)
-        if text:
-            return {
-                "frame_number": frame_num,
-                "timestamp": timestamp,
-                "timestamp_fmt": format_timestamp(timestamp),
-                "object_class": "text",
-                "color": None,
-                "confidence": 0.85,
-                "bbox": None,
-                "text_content": text,
-                "count": None,
-            }
+        regions = extract_text_regions(frame)
+        if regions:
+            return [
+                {
+                    "frame_number": frame_num,
+                    "timestamp": timestamp,
+                    "timestamp_fmt": format_timestamp(timestamp),
+                    "object_class": "text",
+                    "color": None,
+                    "confidence": r["confidence"],
+                    "bbox": r["bbox"],
+                    "text_content": r["text"],
+                    "count": None,
+                }
+                for r in regions
+            ]
         return None
 
     return None

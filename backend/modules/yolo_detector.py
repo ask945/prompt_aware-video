@@ -11,6 +11,32 @@ Interface:
 
 import numpy as np
 
+# ============================================================
+# RELATED CLASS GROUPS
+# When user says "car", also match truck/bus/etc.
+# When user says "person", also match all person-like classes.
+# ============================================================
+
+RELATED_CLASSES = {
+    "car":       {"car", "truck", "bus"},
+    "truck":     {"car", "truck", "bus"},
+    "bus":       {"car", "truck", "bus"},
+    "vehicle":   {"car", "truck", "bus", "motorcycle", "bicycle", "train", "boat"},
+    "person":    {"person"},
+    "bike":      {"bicycle", "motorcycle"},
+    "bicycle":   {"bicycle", "motorcycle"},
+    "motorcycle":{"bicycle", "motorcycle"},
+    "cup":       {"cup", "wine glass", "bottle"},
+    "phone":     {"cell phone"},
+    "mobile":    {"cell phone"},
+    "cell phone":{"cell phone"},
+    "monitor":   {"tv", "laptop"},
+    "screen":    {"tv", "laptop"},
+    "tv":        {"tv", "laptop"},
+    "couch":     {"couch", "chair"},
+    "sofa":      {"couch", "chair"},
+}
+
 # Load model once at module level
 _model = None
 
@@ -62,9 +88,11 @@ def detect(frame: np.ndarray, target: str = None, confidence: float = 0.5) -> li
             cls_id = int(box.cls[0].cpu().numpy())
             cls_name = results[0].names[cls_id]
 
-            # Filter by target if specified
-            if target and cls_name != target:
-                continue
+            # Filter by target if specified (with related class expansion)
+            if target:
+                accepted = RELATED_CLASSES.get(target, {target})
+                if cls_name not in accepted:
+                    continue
 
             detections.append({
                 "object_class": cls_name,

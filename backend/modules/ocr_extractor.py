@@ -1,49 +1,49 @@
 """
 OCR Text Extraction Module
 
-Extracts readable text from video frames using Tesseract OCR.
-Stateless — no internal state between calls.
+Extracts readable text from video frames using EasyOCR.
+Pure Python — no system binary needed. Deploys anywhere.
+
+Supports English + many other scripts (Malayalam, Hindi, etc.)
+Model downloads on first run (~100MB), cached after that.
 
 Interface:
     extract_text(frame) → str or None
+    extract_text_with_confidence(frame) → dict or None
 """
 
-import cv2
+import logging
 import numpy as np
 import re
 
-try:
-    import pytesseract
-    TESSERACT_AVAILABLE = True
-except ImportError:
-    TESSERACT_AVAILABLE = False
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# LAZY-LOADED EASYOCR READER
+# Loaded once on first call, reused across all frames.
+# ============================================================
+
+_reader = None
 
 
-def preprocess(frame: np.ndarray) -> np.ndarray:
-    """
-    Preprocess frame for better OCR accuracy.
-    Grayscale → threshold → denoise → upscale if small.
-    """
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+def _get_reader():
+    """Load EasyOCR reader. Lazy loaded on first call."""
+    global _reader
+    if _reader is None:
+        try:
+            import easyocr
+            # English + Malayalam (add more languages as needed)
+            _reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+            logger.info("EasyOCR reader loaded (languages: en)")
+        except ImportError:
+            logger.error("easyocr not installed. Run: pip install easyocr")
+            raise RuntimeError("Install easyocr: pip install easyocr")
+    return _reader
 
-    # Adaptive threshold handles varying lighting better
-    thresh = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 11, 2
-    )
 
-    # Denoise
-    denoised = cv2.fastNlMeansDenoising(thresh, None, 10, 7, 21)
-
-    # Upscale small images (OCR works better on larger text)
-    h, w = denoised.shape
-    if w < 300 or h < 300:
-        scale = max(2, 300 // min(w, h))
-        denoised = cv2.resize(denoised, None, fx=scale, fy=scale,
-                              interpolation=cv2.INTER_CUBIC)
-
-    return denoised
-
+# ============================================================
+# GIBBERISH FILTER
+# ============================================================
 
 def is_gibberish(text: str) -> bool:
     """
@@ -71,43 +71,73 @@ def is_gibberish(text: str) -> bool:
     return False
 
 
+# ============================================================
+# MAIN EXTRACTION FUNCTIONS
+# ============================================================
+
 def extract_text(frame: np.ndarray) -> str | None:
     """
-    Extract readable text from a video frame.
-
-    Args:
-        frame: BGR image (numpy array)
+    Extract all readable text from a video frame as one combined string.
+    Use extract_text_regions() for per-region results.
 
     Returns:
-        Extracted text string, or None if no text found
+        Combined text string, or None if no text found
     """
-    if not TESSERACT_AVAILABLE:
+    regions = extract_text_regions(frame)
+    if not regions:
         return None
+    combined = " ".join(r["text"] for r in regions)
+    combined = re.sub(r"\s+", " ", combined).strip()
+    return combined
 
+
+def extract_text_regions(frame: np.ndarray) -> list[dict]:
+    """
+    Extract text from a video frame, returning each text region separately
+    with its bounding box and confidence.
+
+    Returns:
+        list of {text, confidence, bbox} dicts. Empty list if nothing found.
+        bbox is [x1, y1, x2, y2].
+    """
     try:
-        processed = preprocess(frame)
+        reader = _get_reader()
 
-        # Run Tesseract
-        raw_text = pytesseract.image_to_string(processed, config="--psm 6")
+        results = reader.readtext(frame, detail=1, paragraph=False)
 
-        # Clean up
-        text = raw_text.strip()
-        # Remove excessive whitespace
-        text = re.sub(r"\s+", " ", text)
+        if not results:
+            logger.debug("OCR found no text regions")
+            return []
 
-        if not text or is_gibberish(text):
-            return None
+        regions = []
+        for bbox_pts, text, conf in results:
+            text = text.strip()
+            if conf >= 0.3 and text and not is_gibberish(text):
+                # EasyOCR bbox is 4 corner points [[x1,y1],[x2,y1],[x2,y2],[x1,y2]]
+                # Convert to [x1, y1, x2, y2]
+                xs = [int(p[0]) for p in bbox_pts]
+                ys = [int(p[1]) for p in bbox_pts]
+                bbox = [min(xs), min(ys), max(xs), max(ys)]
 
-        return text
+                regions.append({
+                    "text": text,
+                    "confidence": round(conf, 3),
+                    "bbox": bbox,
+                })
 
-    except Exception:
-        return None
+        if regions:
+            logger.info(f"OCR found {len(regions)} region(s): {[r['text'][:30] for r in regions]}")
+
+        return regions
+
+    except Exception as e:
+        logger.error(f"OCR failed: {e}")
+        return []
 
 
 def extract_text_with_confidence(frame: np.ndarray) -> dict | None:
     """
     Extract text with per-word confidence scores.
-    Used when analyzer needs confidence data.
 
     Args:
         frame: BGR image (numpy array)
@@ -115,38 +145,37 @@ def extract_text_with_confidence(frame: np.ndarray) -> dict | None:
     Returns:
         dict with text, confidence, word_count or None
     """
-    if not TESSERACT_AVAILABLE:
-        return None
-
     try:
-        processed = preprocess(frame)
+        reader = _get_reader()
 
-        data = pytesseract.image_to_data(processed, output_type=pytesseract.Output.DICT)
+        results = reader.readtext(frame, detail=1, paragraph=False)
+
+        if not results:
+            return None
 
         words = []
         confidences = []
 
-        for i in range(len(data["text"])):
-            word = data["text"][i].strip()
-            conf = int(data["conf"][i])
-
-            if word and conf > 30 and not is_gibberish(word):
-                words.append(word)
-                confidences.append(conf / 100.0)
+        for bbox, text, conf in results:
+            text = text.strip()
+            if conf >= 0.3 and text and not is_gibberish(text):
+                words.append(text)
+                confidences.append(conf)
 
         if not words:
             return None
 
-        text = " ".join(words)
+        combined = " ".join(words)
         avg_conf = round(sum(confidences) / len(confidences), 3)
 
         return {
-            "text": text,
+            "text": combined,
             "confidence": avg_conf,
             "word_count": len(words),
         }
 
-    except Exception:
+    except Exception as e:
+        logger.error(f"OCR with confidence failed: {e}")
         return None
 
 
@@ -155,10 +184,11 @@ def extract_text_with_confidence(frame: np.ndarray) -> dict | None:
 # ============================================================
 
 if __name__ == "__main__":
-    if not TESSERACT_AVAILABLE:
-        print("pytesseract not installed. Run: pip install pytesseract")
-        print("Also install Tesseract binary: sudo apt install tesseract-ocr")
-        exit(1)
+    import cv2
+
+    print("Loading EasyOCR reader (first run downloads model ~100MB)...")
+    reader = _get_reader()
+    print("Reader loaded.\n")
 
     # Create test frame with text
     frame = np.ones((200, 400, 3), dtype=np.uint8) * 255
@@ -184,3 +214,16 @@ if __name__ == "__main__":
     print(f"  'Hello' → {is_gibberish('Hello')}")
     print(f"  'aaaa'  → {is_gibberish('aaaa')}")
     print(f"  'EXIT'  → {is_gibberish('EXIT')}")
+
+    # Test with image file if provided
+    import sys
+    if len(sys.argv) > 1:
+        img = cv2.imread(sys.argv[1])
+        if img is not None:
+            print(f"\n--- Testing on {sys.argv[1]} ---")
+            text = extract_text(img)
+            print(f"Text: '{text}'")
+            result = extract_text_with_confidence(img)
+            print(f"Detailed: {result}")
+        else:
+            print(f"Cannot read image: {sys.argv[1]}")
