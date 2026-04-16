@@ -23,6 +23,9 @@ ultralytics
 # OCR (pure Python — no system binary needed)
 easyocr
 
+# Visual understanding (zero-shot text-image matching)
+open-clip-torch
+
 # HTTP (for downloading videos from Cloudinary)
 requests
 aiofiles

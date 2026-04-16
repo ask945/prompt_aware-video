@@ -12,8 +12,10 @@ import logging
 from datetime import datetime
 
 from core.frame_selector import sample, get_sampling_stats
+from core.prompt_interpreter import YOLO_CLASSES, TARGET_ALIASES
 from modules.yolo_detector import detect
 from modules.color_detector import detect_color, detect_color_top_n, detect_color_full_frame, is_color_match
+from modules.clip_scorer import score_frame, make_clip_prompt
 from modules.ocr_extractor import extract_text, extract_text_regions
 from modules.motion_detector import detect_motion
 from modules.counter import count
@@ -136,29 +138,54 @@ def run_analysis(job_id: str, video_url: str, query_data: dict, strategy_config:
         # ─── Step 2: Prepare config ───
         strategy_config["timestamp"] = query_data.get("timestamp")
 
+        # ─── Step 2b: Check if CLIP should be used instead of YOLO ───
+        target = query_data.get("target")
+        intent = query_data.get("intent")
+        raw_query = query_data.get("raw_query", "")
+        resolved_target = TARGET_ALIASES.get(target, target) if target else None
+        use_clip = (
+            # Target not in YOLO vocabulary (chain, machete, weapon, etc.)
+            (target and resolved_target not in YOLO_CLASSES)
+            # Event/scene intents — YOLO can't understand actions or scene descriptions
+            # "when does the woman fall" needs CLIP even though "person" is a YOLO class
+            or intent in ("event", "scene")
+        )
+
+        if use_clip:
+            strategy_config["modules"] = ["clip"]
+            logger.info(
+                f"Job {job_id}: intent='{intent}', target='{target}' → using CLIP"
+            )
+        else:
+            logger.info(
+                f"Job {job_id}: intent='{intent}', target='{target}' → using YOLO pipeline"
+            )
+
         # ─── Step 3: Prepare detect_fn for coarse-to-fine / binary search ───
+        clip_prompt = make_clip_prompt(raw_query) if use_clip else None
+
         detect_fn = None
         if strategy_config["strategy"] in ("coarse_to_fine", "binary_search"):
-            target = query_data.get("target")
-            attribute = query_data.get("attribute")
-            low_conf = 0.3
-
-            if attribute and "hsv" in strategy_config["modules"]:
-                # Coarse pass with lightweight color pre-filter:
-                # YOLO finds objects, then quick color check narrows candidates.
-                # Uses is_color_match (fuzzy) so it's lenient but still filters
-                # out obviously wrong colors (e.g. white car when looking for red).
-                def detect_fn(frame):
-                    results = detect(frame, target, confidence=low_conf)
-                    if not results:
-                        return False
-                    for r in results:
-                        color = detect_color(frame, r["bbox"])
-                        if is_color_match(color, attribute):
-                            return True
-                    return False
+            if "clip" in strategy_config["modules"]:
+                # CLIP-based coarse pass: score frame against visual prompt
+                CLIP_COARSE_THRESHOLD = 0.20
+                detect_fn = lambda frame: score_frame(frame, clip_prompt) >= CLIP_COARSE_THRESHOLD
             else:
-                detect_fn = lambda frame: len(detect(frame, target, confidence=low_conf)) > 0
+                attribute = query_data.get("attribute")
+                low_conf = 0.3
+
+                if attribute and "hsv" in strategy_config["modules"]:
+                    def detect_fn(frame):
+                        results = detect(frame, target, confidence=low_conf)
+                        if not results:
+                            return False
+                        for r in results:
+                            color = detect_color(frame, r["bbox"])
+                            if is_color_match(color, attribute):
+                                return True
+                        return False
+                else:
+                    detect_fn = lambda frame: len(detect(frame, target, confidence=low_conf)) > 0
 
         # ─── Step 4: Sample frames ───
         logger.info(f"Job {job_id}: sampling frames with strategy={strategy_config['strategy']}")
@@ -244,9 +271,31 @@ def run_analysis(job_id: str, video_url: str, query_data: dict, strategy_config:
                     frames_processed=frames_analyzed,
                 )
 
-        # ─── Step 7: Filter out low-confidence soft-scored detections ───
-        MIN_RESULT_CONFIDENCE = 0.35
-        detections = [d for d in detections if d["confidence"] >= MIN_RESULT_CONFIDENCE]
+        # ─── Step 7: Filter and rank detections ───
+        is_clip = "clip" in strategy_config.get("modules", [])
+
+        if is_clip and detections:
+            # CLIP scores are on a different scale (0.18-0.35 typical).
+            # Use relative scoring: keep top frames that are significantly
+            # above the mean score (the "spike" frames where the event happens).
+            scores = [d["confidence"] for d in detections]
+            mean_score = sum(scores) / len(scores)
+            std_score = (sum((s - mean_score) ** 2 for s in scores) / len(scores)) ** 0.5
+            # Keep frames scoring > mean + 0.5*std (the peaks)
+            clip_threshold = mean_score + 0.5 * max(std_score, 0.005)
+            detections = [d for d in detections if d["confidence"] >= clip_threshold]
+            # Cap at top 10 most relevant frames
+            detections.sort(key=lambda d: d["confidence"], reverse=True)
+            detections = detections[:10]
+            logger.info(
+                f"Job {job_id}: CLIP relative filter — mean={mean_score:.4f}, "
+                f"std={std_score:.4f}, threshold={clip_threshold:.4f}, "
+                f"kept {len(detections)} detections"
+            )
+        else:
+            # YOLO/HSV detections — absolute threshold
+            MIN_RESULT_CONFIDENCE = 0.35
+            detections = [d for d in detections if d["confidence"] >= MIN_RESULT_CONFIDENCE]
 
         # ─── Step 8: Build stats ───
         total_time = round(time.time() - start_time, 2)
@@ -291,6 +340,28 @@ def _analyze_single_frame(frame, prev_frame, frame_num, timestamp, query_data, m
 
     target = query_data.get("target")
     attribute = query_data.get("attribute")
+    raw_query = query_data.get("raw_query", "")
+
+    # ── CLIP zero-shot matching (handles actions, interactions, unknown objects) ──
+    if "clip" in modules:
+        CLIP_FINE_THRESHOLD = 0.18
+        # Use pre-built clip_prompt from query_data if available, else build it
+        clip_prompt = query_data.get("_clip_prompt") or make_clip_prompt(raw_query)
+        query_data["_clip_prompt"] = clip_prompt  # cache for next frame
+        similarity = score_frame(frame, clip_prompt)
+        if similarity >= CLIP_FINE_THRESHOLD:
+            return {
+                "frame_number": frame_num,
+                "timestamp": timestamp,
+                "timestamp_fmt": format_timestamp(timestamp),
+                "object_class": "clip_match",
+                "color": None,
+                "confidence": round(float(similarity), 3),
+                "bbox": None,
+                "text_content": raw_query,
+                "count": None,
+            }
+        return None
 
     # ── Motion check (gates everything for event detection) ──
     if "motion" in modules:
