@@ -26,22 +26,30 @@ export default function AnalysisDetails({ stats }) {
             <DetailRow
               icon={<BarChart3 className="w-4 h-4" />}
               label="Frames"
-              value={`${stats.processed_frames} of ${stats.total_frames.toLocaleString()} processed`}
+              value={`${stats.processed_frames ?? 0} of ${(stats.total_frames ?? 0).toLocaleString()} processed`}
             />
             <DetailRow
               icon={<Layers className="w-4 h-4" />}
               label="Reduction"
-              value={`${stats.reduction_percent}% frames skipped`}
+              value={
+                stats.reduction_percent !== null && stats.reduction_percent !== undefined
+                  ? `${stats.reduction_percent}% frames skipped`
+                  : '—'
+              }
             />
             <DetailRow
               icon={<Crosshair className="w-4 h-4" />}
               label="Strategy"
-              value={stats.strategy}
+              value={stats.strategy || '—'}
             />
             <DetailRow
               icon={<Target className="w-4 h-4" />}
               label="Intent / Target"
-              value={`${stats.intent} → "${stats.target}"`}
+              value={
+                stats.intent
+                  ? `${stats.intent}${stats.target ? ` → "${stats.target}"` : ''}`
+                  : '—'
+              }
             />
           </div>
 

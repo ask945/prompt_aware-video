@@ -75,16 +75,32 @@ async def get_results(
             "color": d.color,
             "confidence": d.confidence,
             "bbox": bbox,
+            "count": d.count,
+            "track_id": d.track_id,
             "frame_url": d.frame_url,
             "text_content": d.text_content,
         })
-    
+
+    # For counting intent, surface both the unique tracked count AND per-frame stats
+    count_summary = None
+    if job.intent == "counting":
+        counts = [d["count"] for d in formatted_detections if d["count"] is not None]
+        if counts:
+            count_summary = {
+                "unique_count": job.unique_count,  # total unique tracked objects
+                "max": max(counts),                 # peak simultaneous per frame
+                "min": min(counts),
+                "avg": round(sum(counts) / len(counts), 1),
+                "frames_with_count": len(counts),
+            }
+
     result = {
         "job_id": str(job.id),
         "status": "complete",
         "found": job.result_found or False,
         "confidence": job.confidence or 0.0,
         "detection_count": len(formatted_detections),
+        "count_summary": count_summary,
         "detections": formatted_detections,
         "stats": {
             "total_frames": job.total_frames,

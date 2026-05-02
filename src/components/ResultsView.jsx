@@ -1,4 +1,4 @@
-import { CheckCircle, AlertCircle, Zap, MessageSquare } from 'lucide-react';
+import { CheckCircle, AlertCircle, Zap, MessageSquare, Users } from 'lucide-react';
 import DetectionCard from './DetectionCard';
 import VideoPlayer from './VideoPlayer';
 import AnalysisDetails from './AnalysisDetails';
@@ -29,6 +29,45 @@ export default function ResultsView({
       <div className="flex flex-col lg:flex-row gap-6">
         {/* Left column - Results (60%) */}
         <div className="flex-1 lg:w-3/5 space-y-5">
+          {/* Counting summary banner (only for counting intent) */}
+          {stats?.count_summary && (
+            <div className="bg-gradient-to-r from-primary-light to-primary-light/40 border border-primary/30 rounded-xl p-5">
+              <div className="flex items-center gap-4">
+                <div className="w-14 h-14 bg-primary rounded-full flex items-center justify-center flex-shrink-0">
+                  <Users className="w-7 h-7 text-white" />
+                </div>
+                <div className="flex-1">
+                  <p className="text-xs uppercase tracking-wide text-primary-dark font-semibold">
+                    Total unique {stats?.target || 'object'}{(stats.count_summary.unique_count ?? stats.count_summary.max) !== 1 ? 's' : ''} detected
+                  </p>
+                  {typeof stats.count_summary.unique_count === 'number' ? (
+                    <>
+                      <p className="mt-1 text-3xl font-bold text-text">
+                        {stats.count_summary.unique_count}
+                      </p>
+                      <p className="text-xs text-text-secondary mt-1">
+                        Peak simultaneous: <span className="font-semibold text-text">{stats.count_summary.max}</span>
+                        {' • '}
+                        Avg per frame: <span className="font-semibold text-text">{stats.count_summary.avg}</span>
+                        {' • '}
+                        across {stats.count_summary.frames_with_count} analyzed frame{stats.count_summary.frames_with_count !== 1 ? 's' : ''}
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <p className="mt-1 text-2xl font-bold text-text">
+                        Up to <span className="text-primary-dark">{stats.count_summary.max}</span> at once
+                      </p>
+                      <p className="text-xs text-text-secondary mt-0.5">
+                        avg {stats.count_summary.avg}, min {stats.count_summary.min}, across {stats.count_summary.frames_with_count} frames
+                      </p>
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Summary */}
           <div className="bg-card border border-border rounded-xl p-5">
             <div className="flex items-start gap-3">

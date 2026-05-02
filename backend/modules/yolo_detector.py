@@ -42,19 +42,25 @@ _model = None
 
 
 def _get_model():
-    """Load YOLOv8-nano model. Lazy loaded on first call."""
+    """
+    Load YOLOv8-small model. Lazy loaded on first call.
+
+    YOLOv8s (22MB) is ~2x slower than yolov8n but significantly more accurate
+    on crowded scenes, small/distant objects, and partially occluded people.
+    Downloaded on first run, cached after.
+    """
     global _model
     if _model is None:
         try:
             from ultralytics import YOLO
-            _model = YOLO("yolov8n.pt")
+            _model = YOLO("yolov8s.pt")
             _model.to("cpu")
         except ImportError:
             raise RuntimeError("Install ultralytics: pip install ultralytics")
     return _model
 
 
-def detect(frame: np.ndarray, target: str = None, confidence: float = 0.5) -> list:
+def detect(frame: np.ndarray, target: str = None, confidence: float = 0.25) -> list:
     """
     Detect objects in a frame.
 
@@ -103,6 +109,98 @@ def detect(frame: np.ndarray, target: str = None, confidence: float = 0.5) -> li
         # Sort by confidence descending
         detections.sort(key=lambda d: d["confidence"], reverse=True)
 
+        return detections
+
+    except Exception:
+        return []
+
+
+# ============================================================
+# TRACKING — ByteTrack via ultralytics built-in tracker
+# Assigns persistent track_id to detections across frames.
+# Used for "how many unique X" queries instead of per-frame counting.
+# ============================================================
+
+def track(
+    frame: np.ndarray,
+    target: str = None,
+    confidence: float = 0.25,
+    reset: bool = False,
+) -> list:
+    """
+    Detect + track objects in a frame using ByteTrack.
+
+    Call sequentially on frames from the same video. The tracker
+    maintains state via persist=True, assigning the same track_id
+    to the same object across frames.
+
+    Args:
+        frame: BGR image (numpy array)
+        target: optional class filter (e.g. "car", "person") — expanded via RELATED_CLASSES
+        confidence: minimum detection confidence (lower than detect() because
+                    ByteTrack uses two-stage matching including low-conf boxes)
+        reset: if True, clear tracker state (use at start of a new video)
+
+    Returns:
+        list of dicts: {object_class, confidence, bbox, track_id}
+        track_id may be None on the very first frame before the tracker
+        has assigned an ID.
+    """
+    model = _get_model()
+
+    # Reset tracker state between jobs to prevent ID bleed across videos
+    if reset:
+        try:
+            if hasattr(model, "predictor") and model.predictor is not None:
+                if hasattr(model.predictor, "trackers") and model.predictor.trackers:
+                    for tracker in model.predictor.trackers:
+                        if hasattr(tracker, "reset"):
+                            tracker.reset()
+        except Exception:
+            pass  # safe to ignore — reset is best-effort
+
+    try:
+        results = model.track(
+            frame,
+            conf=confidence,
+            persist=True,
+            tracker="bytetrack.yaml",
+            verbose=False,
+        )
+
+        if not results or len(results) == 0:
+            return []
+
+        detections = []
+        boxes = results[0].boxes
+
+        # track IDs may be None for freshly-created tracks
+        ids = None
+        if boxes.id is not None:
+            ids = boxes.id.cpu().numpy().astype(int)
+
+        for i, box in enumerate(boxes):
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+            conf = float(box.conf[0].cpu().numpy())
+            cls_id = int(box.cls[0].cpu().numpy())
+            cls_name = results[0].names[cls_id]
+
+            # Filter by target if specified (same logic as detect())
+            if target:
+                accepted = RELATED_CLASSES.get(target, {target})
+                if cls_name not in accepted:
+                    continue
+
+            track_id = int(ids[i]) if ids is not None else None
+
+            detections.append({
+                "object_class": cls_name,
+                "confidence": round(conf, 3),
+                "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                "track_id": track_id,
+            })
+
+        detections.sort(key=lambda d: d["confidence"], reverse=True)
         return detections
 
     except Exception:

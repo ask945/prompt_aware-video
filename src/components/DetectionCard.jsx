@@ -1,4 +1,4 @@
-import { Eye, Clock, Target } from 'lucide-react';
+import { Eye, Clock, Target, Users } from 'lucide-react';
 
 function formatTime(seconds) {
   const mins = Math.floor(seconds / 60);
@@ -15,6 +15,21 @@ function confidenceColor(confidence) {
 export default function DetectionCard({ detection, index, onClick }) {
   const conf = Math.round(detection.confidence * 100);
 
+  // Only show text content when this is actually an OCR result
+  const isOcr = detection.object_class === 'text' && detection.text_content;
+  const isClipMatch = detection.object_class === 'clip_match';
+
+  let title;
+  if (isOcr) {
+    title = 'Text Found';
+  } else if (isClipMatch) {
+    title = 'Scene Match';
+  } else if (detection.color && detection.label) {
+    title = `${detection.color} ${detection.label}`;
+  } else {
+    title = detection.label;
+  }
+
   return (
     <button
       onClick={() => onClick(detection.timestamp)}
@@ -28,18 +43,18 @@ export default function DetectionCard({ detection, index, onClick }) {
         <div className="flex-1 min-w-0">
           <div className="flex items-center justify-between gap-2">
             <h4 className="text-sm font-semibold text-text truncate">
-              {detection.text_content ? 'Text Found' : detection.label}
+              {title}
             </h4>
             <span className={`text-xs font-bold px-2 py-0.5 rounded-full flex-shrink-0 ${confidenceColor(detection.confidence)}`}>
               {conf}%
             </span>
           </div>
-          {detection.text_content && (
+          {isOcr && (
             <p className="mt-1.5 text-xs text-text bg-bg rounded-lg px-3 py-2 font-mono leading-relaxed line-clamp-3">
               {detection.text_content}
             </p>
           )}
-          <div className="flex items-center gap-3 mt-1.5 text-xs text-text-secondary">
+          <div className="flex items-center gap-3 mt-1.5 text-xs text-text-secondary flex-wrap">
             <span className="flex items-center gap-1">
               <Clock className="w-3 h-3" />
               {formatTime(detection.timestamp)}
@@ -48,6 +63,12 @@ export default function DetectionCard({ detection, index, onClick }) {
               <Target className="w-3 h-3" />
               Frame {detection.frame_number}
             </span>
+            {typeof detection.count === 'number' && detection.count > 0 && (
+              <span className="flex items-center gap-1 text-primary-dark font-semibold">
+                <Users className="w-3 h-3" />
+                {detection.count} {detection.label || 'object'}{detection.count !== 1 ? 's' : ''}
+              </span>
+            )}
           </div>
         </div>
       </div>

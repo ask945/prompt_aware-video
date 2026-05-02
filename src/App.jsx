@@ -48,6 +48,7 @@ export default function App() {
   const [followUpQuery, setFollowUpQuery] = useState('');
   const [queryHistory, setQueryHistory] = useState([]);
   const pollingRef = useRef(null);
+  const jobStartedAtRef = useRef(null);
 
   useEffect(() => {
     async function restoreSession() {
@@ -91,12 +92,23 @@ export default function App() {
 
           if (data.status === 'processing') {
             setJobProgress(data.progress || 0);
+            const elapsed = jobStartedAtRef.current
+              ? ((Date.now() - jobStartedAtRef.current) / 1000).toFixed(1)
+              : '0';
+            const total = data.total_frames || 0;
+            const processed = data.frames_processed || 0;
+            const reduction = total > 0
+              ? (((total - processed) / total) * 100).toFixed(1)
+              : null;
             setJobStats({
-              processed_frames: data.frames_processed || 0,
-              total_frames: data.total_frames || 0,
+              processed_frames: processed,
+              total_frames: total,
               strategy: data.strategy,
               modules: data.modules || [],
-              time_elapsed: 0,
+              intent: data.intent,
+              target: data.target,
+              time_elapsed: elapsed,
+              reduction_percent: reduction,
             });
             return;
           }
@@ -109,27 +121,38 @@ export default function App() {
             setDetections(
               (data.detections || []).map((d, i) => ({
                 id: `det-${i}`,
-                label: d.text_content || d.object_class || 'Detection',
+                label: d.object_class || 'Detection',
+                object_class: d.object_class,
                 confidence: d.confidence || 0,
                 timestamp: d.timestamp || 0,
                 timestamp_fmt: d.timestamp_fmt || '',
                 frame_number: d.frame_number,
                 color: d.color,
                 bbox: d.bbox,
+                count: d.count,
+                track_id: d.track_id,
                 frame_url: d.frame_url,
                 text_content: d.text_content,
               }))
             );
+            const statsBlock = data.stats || {};
+            const total = statsBlock.total_frames || 0;
+            const processed = statsBlock.frames_processed || 0;
+            const reduction = total > 0
+              ? (((total - processed) / total) * 100).toFixed(1)
+              : null;
             setJobStats({
-              processed_frames: data.stats?.frames_processed || 0,
-              total_frames: data.stats?.total_frames || 0,
-              time_elapsed: data.stats?.time_taken ? data.stats.time_taken.toFixed(1) : '0',
-              strategy: data.stats?.strategy,
-              modules: data.stats?.modules || [],
-              intent: data.stats?.intent,
-              target: data.stats?.target,
-              attribute: data.stats?.attribute,
-              temporal_scope: data.stats?.temporal_scope,
+              processed_frames: processed,
+              total_frames: total,
+              time_elapsed: statsBlock.time_taken ? statsBlock.time_taken.toFixed(1) : '0',
+              reduction_percent: reduction,
+              strategy: statsBlock.strategy,
+              modules: statsBlock.modules || [],
+              intent: statsBlock.intent,
+              target: statsBlock.target,
+              attribute: statsBlock.attribute,
+              temporal_scope: statsBlock.temporal_scope,
+              count_summary: data.count_summary || null,
             });
             setQueryHistory((prev) => [
               { query, found: data.found, count: data.detection_count || 0 },
@@ -172,6 +195,7 @@ export default function App() {
     setJobError(null);
     setSeekTimestamp(null);
     setFollowUpQuery('');
+    jobStartedAtRef.current = null;
   }, [stopPolling]);
 
   const handleAuthSubmit = async (event) => {
@@ -250,6 +274,7 @@ export default function App() {
     setAnalyzing(true);
     setJobStatus('processing');
     setJobProgress(0);
+    jobStartedAtRef.current = Date.now();
 
     try {
       const data = await analyzeVideo({

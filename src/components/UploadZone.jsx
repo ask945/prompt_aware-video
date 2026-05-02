@@ -1,6 +1,6 @@
-import { useCallback } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useDropzone } from 'react-dropzone';
-import { Upload, Film, X, FileVideo } from 'lucide-react';
+import { Upload, Film, X, Play } from 'lucide-react';
 import toast from 'react-hot-toast';
 
 const ACCEPTED_FORMATS = {
@@ -25,6 +25,36 @@ function formatDuration(seconds) {
 }
 
 export default function UploadZone({ videoFile, videoInfo, uploading, onUpload, onRemove }) {
+  const [previewOpen, setPreviewOpen] = useState(false);
+
+  // Resolve a playable video source — prefer local File (instant, no network)
+  // and fall back to the Cloudinary URL for library videos.
+  const videoSrc = useMemo(() => {
+    if (videoFile) {
+      return URL.createObjectURL(videoFile);
+    }
+    return videoInfo?.url || null;
+  }, [videoFile, videoInfo?.url]);
+
+  useEffect(() => {
+    // Revoke the blob URL when the component unmounts or source changes
+    return () => {
+      if (videoFile && videoSrc) {
+        URL.revokeObjectURL(videoSrc);
+      }
+    };
+  }, [videoFile, videoSrc]);
+
+  // Close the preview modal on Escape
+  useEffect(() => {
+    if (!previewOpen) return;
+    const handler = (e) => {
+      if (e.key === 'Escape') setPreviewOpen(false);
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [previewOpen]);
+
   const onDrop = useCallback((acceptedFiles, rejectedFiles) => {
     if (rejectedFiles.length > 0) {
       const error = rejectedFiles[0].errors[0];
@@ -53,28 +83,66 @@ export default function UploadZone({ videoFile, videoInfo, uploading, onUpload, 
 
   if (videoInfo) {
     return (
-      <div className="animate-fade-in bg-card border border-border rounded-xl p-4 flex items-center gap-4">
-        <div className="w-16 h-16 bg-primary-light rounded-lg flex items-center justify-center flex-shrink-0">
-          <FileVideo className="w-8 h-8 text-primary-dark" />
-        </div>
-        <div className="flex-1 min-w-0">
-          <p className="text-sm font-medium text-text truncate">{videoInfo.filename}</p>
-          <div className="flex items-center gap-3 mt-1 text-xs text-text-secondary">
-            <span>{formatSize(videoInfo.size || videoFile?.size || 0)}</span>
-            <span>|</span>
-            <span>{formatDuration(videoInfo.duration || 0)}</span>
-            <span>|</span>
-            <span>{(videoInfo.total_frames || 0).toLocaleString()} frames</span>
+      <>
+        <div className="animate-fade-in bg-card border border-border rounded-xl p-4 flex items-center gap-4">
+          {/* Thumbnail on the left — click to open preview */}
+          <button
+            type="button"
+            onClick={() => setPreviewOpen(true)}
+            className="relative w-24 h-16 rounded-lg overflow-hidden flex-shrink-0 bg-black group focus:outline-none focus:ring-2 focus:ring-primary"
+            title="Click to preview"
+          >
+            {videoSrc ? (
+              <video
+                src={videoSrc}
+                className="w-full h-full object-cover pointer-events-none"
+                preload="metadata"
+                muted
+                playsInline
+              />
+            ) : (
+              <div className="w-full h-full flex items-center justify-center bg-primary-light">
+                <Film className="w-6 h-6 text-primary-dark" />
+              </div>
+            )}
+            {/* Play icon overlay */}
+            <div className="absolute inset-0 flex items-center justify-center bg-black/30 opacity-80 group-hover:opacity-100 transition-opacity">
+              <div className="w-8 h-8 rounded-full bg-white/90 flex items-center justify-center">
+                <Play className="w-4 h-4 text-primary-dark ml-0.5" fill="currentColor" />
+              </div>
+            </div>
+          </button>
+
+          {/* Name + metadata on the right */}
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-medium text-text truncate">{videoInfo.filename}</p>
+            <div className="flex items-center gap-3 mt-1 text-xs text-text-secondary">
+              <span>{formatSize(videoInfo.size || videoFile?.size || 0)}</span>
+              <span>|</span>
+              <span>{formatDuration(videoInfo.duration || 0)}</span>
+              <span>|</span>
+              <span>{(videoInfo.total_frames || 0).toLocaleString()} frames</span>
+            </div>
           </div>
+
+          <button
+            onClick={onRemove}
+            className="p-2 text-text-secondary hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
+            title="Remove video"
+          >
+            <X className="w-4 h-4" />
+          </button>
         </div>
-        <button
-          onClick={onRemove}
-          className="p-2 text-text-secondary hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
-          title="Remove video"
-        >
-          <X className="w-4 h-4" />
-        </button>
-      </div>
+
+        {/* Preview modal */}
+        {previewOpen && (
+          <VideoPreviewModal
+            src={videoSrc}
+            filename={videoInfo.filename}
+            onClose={() => setPreviewOpen(false)}
+          />
+        )}
+      </>
     );
   }
 
@@ -114,6 +182,48 @@ export default function UploadZone({ videoFile, videoInfo, uploading, onUpload, 
             </div>
           </>
         )}
+      </div>
+    </div>
+  );
+}
+
+
+function VideoPreviewModal({ src, filename, onClose }) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm animate-fade-in p-4"
+      onClick={onClose}
+    >
+      <div
+        className="relative w-full max-w-3xl bg-card rounded-2xl shadow-xl overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-5 py-3 border-b border-border">
+          <p className="text-sm font-medium text-text truncate pr-4">{filename}</p>
+          <button
+            type="button"
+            onClick={onClose}
+            className="p-1.5 rounded-lg text-text-secondary hover:text-text hover:bg-bg transition-colors flex-shrink-0"
+            title="Close (Esc)"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+        <div className="bg-black">
+          {src ? (
+            <video
+              src={src}
+              className="w-full max-h-[70vh] object-contain"
+              controls
+              autoPlay
+              playsInline
+            />
+          ) : (
+            <div className="aspect-video flex items-center justify-center text-white/60 text-sm">
+              Video source unavailable
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

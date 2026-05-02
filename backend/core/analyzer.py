@@ -13,12 +13,12 @@ from datetime import datetime
 
 from core.frame_selector import sample, get_sampling_stats
 from core.prompt_interpreter import YOLO_CLASSES, TARGET_ALIASES
-from modules.yolo_detector import detect
+from modules.yolo_detector import detect, track
 from modules.color_detector import detect_color, detect_color_top_n, detect_color_full_frame, is_color_match
 from modules.clip_scorer import score_frame, make_clip_prompt
 from modules.ocr_extractor import extract_text, extract_text_regions
 from modules.motion_detector import detect_motion
-from modules.counter import count
+from modules.counter import count, count_unique
 from utils.video_utils import download_from_cloudinary, cleanup_temp
 from utils.helpers import format_timestamp
 from database.db import SessionLocal
@@ -63,10 +63,15 @@ def _complete_job(job_id: str, found: bool, confidence: float, detections: list,
         job.time_taken = float(stats.get("time_taken") or 0)
         job.total_frames = int(stats.get("total_frames") or 0)
         job.frames_processed = int(stats.get("frames_processed") or 0)
+        unique_count_val = stats.get("unique_count")
+        if unique_count_val is not None:
+            job.unique_count = int(unique_count_val)
         job.completed_at = datetime.utcnow()
 
         for d in detections:
             bbox = d.get("bbox")
+            count_val = d.get("count")
+            track_id_val = d.get("track_id")
             det = Detection(
                 job_id=job_id,
                 frame_number=int(d["frame_number"]),
@@ -79,6 +84,8 @@ def _complete_job(job_id: str, found: bool, confidence: float, detections: list,
                 bbox_y1=int(bbox[1]) if bbox else None,
                 bbox_x2=int(bbox[2]) if bbox else None,
                 bbox_y2=int(bbox[3]) if bbox else None,
+                count=int(count_val) if count_val is not None else None,
+                track_id=int(track_id_val) if track_id_val is not None else None,
                 frame_url=None,
                 text_content=d.get("text_content"),
             )
@@ -143,13 +150,46 @@ def run_analysis(job_id: str, video_url: str, query_data: dict, strategy_config:
         intent = query_data.get("intent")
         raw_query = query_data.get("raw_query", "")
         resolved_target = TARGET_ALIASES.get(target, target) if target else None
-        use_clip = (
-            # Target not in YOLO vocabulary (chain, machete, weapon, etc.)
-            (target and resolved_target not in YOLO_CLASSES)
-            # Event/scene intents — YOLO can't understand actions or scene descriptions
-            # "when does the woman fall" needs CLIP even though "person" is a YOLO class
-            or intent in ("event", "scene")
-        )
+
+        # Typo tolerance: only for intents that actually use YOLO.
+        # Skip for OCR/scene/event (they don't rely on YOLO class lookup).
+        # This prevents nonsense matches like "board" → "keyboard".
+        YOLO_BASED_INTENTS = {"object", "object_color", "counting", "color"}
+        if target and resolved_target not in YOLO_CLASSES and intent in YOLO_BASED_INTENTS:
+            import difflib
+            candidates = list(YOLO_CLASSES) + list(TARGET_ALIASES.keys())
+            close = difflib.get_close_matches(target, candidates, n=1, cutoff=0.75)
+            if close:
+                corrected = close[0]
+                resolved_target = TARGET_ALIASES.get(corrected, corrected)
+                logger.info(
+                    f"Job {job_id}: fuzzy-matched target '{target}' → '{resolved_target}'"
+                )
+                query_data["target"] = resolved_target
+                target = resolved_target
+
+        # Counting intent MUST use YOLO — CLIP can't count objects.
+        # If no YOLO target, default to "person" (most common counting case).
+        if intent == "counting":
+            if not target or resolved_target not in YOLO_CLASSES:
+                logger.info(
+                    f"Job {job_id}: counting intent with unknown target '{target}', "
+                    f"defaulting to 'person'"
+                )
+                query_data["target"] = "person"
+                target = "person"
+                resolved_target = "person"
+            use_clip = False
+        elif intent == "ocr":
+            # OCR has its own dedicated pipeline (EasyOCR); don't hijack to CLIP
+            use_clip = False
+        else:
+            use_clip = (
+                # Target not in YOLO vocabulary (chain, machete, weapon, etc.)
+                (target and resolved_target not in YOLO_CLASSES)
+                # Event/scene intents — YOLO can't understand actions or scene descriptions
+                or intent in ("event", "scene")
+            )
 
         if use_clip:
             strategy_config["modules"] = ["clip"]
@@ -221,10 +261,24 @@ def run_analysis(job_id: str, video_url: str, query_data: dict, strategy_config:
             total_frames=stats["total_frames"],
         )
 
+        # ─── Step 4c: Reset tracker + ensure sequential order for counting ───
+        is_counting = intent == "counting" and "counter" in strategy_config["modules"]
+        if is_counting:
+            # Sort frames ascending by frame_number so tracker sees them in time order
+            selected_frames = sorted(selected_frames, key=lambda f: f["frame_number"])
+            # Prime tracker state reset with a dummy call on the first frame
+            if selected_frames:
+                try:
+                    track(selected_frames[0]["frame"], target, confidence=0.25, reset=True)
+                    logger.info(f"Job {job_id}: tracker reset for counting")
+                except Exception as e:
+                    logger.warning(f"Job {job_id}: tracker reset failed — {e}")
+
         # ─── Step 5: Analyze selected frames ───
         detections = []
         prev_frame = None
         frames_analyzed = 0
+        tracked_ids_seen = set()  # aggregates unique track IDs for counting
 
         for i, frame_info in enumerate(selected_frames):
             frame = frame_info["frame"]
@@ -250,6 +304,9 @@ def run_analysis(job_id: str, video_url: str, query_data: dict, strategy_config:
                 else:
                     detections.append(result)
                     best_conf = result["confidence"]
+                    # Aggregate ALL tracked IDs seen in this frame (not just best)
+                    frame_ids = result.get("tracked_ids_in_frame") or []
+                    tracked_ids_seen.update(frame_ids)
 
                 # ─── Step 6: Early termination ───
                 if strategy_config["early_stop"]:
@@ -294,8 +351,54 @@ def run_analysis(job_id: str, video_url: str, query_data: dict, strategy_config:
             )
         else:
             # YOLO/HSV detections — absolute threshold
-            MIN_RESULT_CONFIDENCE = 0.35
+            MIN_RESULT_CONFIDENCE = 0.25
             detections = [d for d in detections if d["confidence"] >= MIN_RESULT_CONFIDENCE]
+
+            # For object_color queries: if any frame had a real color match
+            # (exact or top-2), drop the "no-match" detections that were
+            # heavily penalized. They're just wrong-colored objects from
+            # frames where no matching object existed.
+            tiers = {d.get("_match_tier") for d in detections}
+            if "exact" in tiers or "top-2" in tiers:
+                before = len(detections)
+                detections = [d for d in detections if d.get("_match_tier") != "no-match"]
+                logger.info(
+                    f"Job {job_id}: found real color matches — dropped "
+                    f"{before - len(detections)} no-match detections"
+                )
+
+            # Strip internal-only field before DB save
+            for d in detections:
+                d.pop("_match_tier", None)
+
+        # ─── Step 7b: Dedupe OCR detections by normalized text ───
+        # Same sign text appears in every frame. Keep one instance per
+        # unique text (the earliest occurrence, highest confidence).
+        if intent == "ocr" and detections:
+            import re as _re
+            before = len(detections)
+            seen = {}
+            for d in detections:
+                text = (d.get("text_content") or "").strip()
+                if not text:
+                    continue
+                # Normalize: lowercase, strip non-alphanumerics for grouping
+                # ("Edappone" == "(Edappone" == "lEdappone" → same group)
+                key = _re.sub(r"[^a-z0-9]", "", text.lower())
+                if len(key) < 2:
+                    continue  # too short to dedupe meaningfully
+                existing = seen.get(key)
+                if existing is None:
+                    seen[key] = d
+                else:
+                    # Keep highest confidence; if tied, keep earliest timestamp
+                    if (d["confidence"], -d["timestamp"]) > (existing["confidence"], -existing["timestamp"]):
+                        seen[key] = d
+            detections = sorted(seen.values(), key=lambda d: d["timestamp"])
+            logger.info(
+                f"Job {job_id}: OCR deduped {before} → {len(detections)} "
+                f"unique text regions"
+            )
 
         # ─── Step 8: Build stats ───
         total_time = round(time.time() - start_time, 2)
@@ -312,7 +415,14 @@ def run_analysis(job_id: str, video_url: str, query_data: dict, strategy_config:
             "time_taken": total_time,
             "fps": stats["fps"],
             "duration": stats["duration"],
+            "unique_count": len(tracked_ids_seen) if tracked_ids_seen else None,
         }
+
+        if is_counting:
+            logger.info(
+                f"Job {job_id}: counted {len(tracked_ids_seen)} unique "
+                f"{target}(s) across {frames_analyzed} frames"
+            )
 
         # ─── Step 8: Save results ───
         _complete_job(
@@ -358,7 +468,7 @@ def _analyze_single_frame(frame, prev_frame, frame_num, timestamp, query_data, m
                 "color": None,
                 "confidence": round(float(similarity), 3),
                 "bbox": None,
-                "text_content": raw_query,
+                "text_content": None,
                 "count": None,
             }
         return None
@@ -371,30 +481,77 @@ def _analyze_single_frame(frame, prev_frame, frame_num, timestamp, query_data, m
         if not motion["detected"]:
             return None
 
-    # ── YOLO object detection ──
+    # ── YOLO object detection (with tracking for counting intent) ──
     if "yolo" in modules:
-        results = detect(frame, target)
+        use_tracking = "counter" in modules
+        if use_tracking:
+            results = track(frame, target, confidence=0.25)
+        else:
+            results = detect(frame, target)
+
         if not results:
+            logger.info(f"Frame {frame_num}: YOLO found 0 '{target}'")
             return None
 
-        best = max(results, key=lambda d: d["confidence"])
-
-        # Soft color scoring — never discard, just penalize confidence
+        # Color-aware candidate selection:
+        # When a color is requested, iterate through ALL detected objects
+        # and prefer ones where HSV color matches. Don't just pick the
+        # highest-confidence detection (which might be a different-colored
+        # object — e.g. a white van at 0.88 conf vs maroon car at 0.55).
         if "hsv" in modules and attribute:
-            dominant_color = detect_color(frame, best["bbox"])
-            top_colors = detect_color_top_n(frame, best["bbox"], n=2)
+            exact_matches = []     # color exactly matches (or via similarity)
+            top2_matches = []      # color in top-2 dominant
+            no_matches = []        # color not found
 
-            if is_color_match(dominant_color, attribute):
-                # Exact match on dominant color — full confidence
-                best["color"] = dominant_color
-            elif attribute in top_colors or any(is_color_match(c, attribute) for c in top_colors):
-                # Wanted color is in top-2 — reduce confidence by 20%
+            for r in results:
+                dom = detect_color(frame, r["bbox"])
+                top = detect_color_top_n(frame, r["bbox"], n=2)
+                r["_dominant_color"] = dom
+                r["_top_colors"] = top
+                if is_color_match(dom, attribute):
+                    exact_matches.append(r)
+                elif any(is_color_match(c, attribute) for c in top):
+                    top2_matches.append(r)
+                else:
+                    no_matches.append(r)
+
+            # Prefer exact match → top-2 match → best by confidence
+            if exact_matches:
+                best = max(exact_matches, key=lambda d: d["confidence"])
+                # Label with the REQUESTED color (what user asked for),
+                # not the base HSV bucket. Keep HSV observation for debugging.
                 best["color"] = attribute
+                best["hsv_dominant"] = best["_dominant_color"]
+                match_tier = "exact"
+            elif top2_matches:
+                best = max(top2_matches, key=lambda d: d["confidence"])
+                best["color"] = attribute
+                best["hsv_dominant"] = best["_dominant_color"]
                 best["confidence"] *= 0.8
+                match_tier = "top-2"
             else:
-                # Color mismatch — heavy penalty but still return detection
-                best["color"] = dominant_color
+                best = max(no_matches, key=lambda d: d["confidence"])
+                # Here the detected color genuinely doesn't match —
+                # keep the HSV observation so user sees the mismatch
+                best["color"] = best["_dominant_color"]
                 best["confidence"] *= 0.3
+                match_tier = "no-match"
+
+            # Tag so step-7 can drop no-match detections when real matches exist
+            best["_match_tier"] = match_tier
+
+            logger.info(
+                f"Frame {frame_num}: YOLO found {len(results)} '{target}'(s), "
+                f"picked {match_tier} match — class={best['object_class']}, "
+                f"dom='{best['_dominant_color']}', top={best['_top_colors']}, "
+                f"wanted='{attribute}', conf={best['confidence']:.3f}"
+            )
+        else:
+            best = max(results, key=lambda d: d["confidence"])
+            logger.info(
+                f"Frame {frame_num}: YOLO found {len(results)} '{target}'(s), "
+                f"best={best['object_class']} (conf={best['confidence']})"
+            )
 
         # Count objects
         if "counter" in modules:
@@ -410,6 +567,13 @@ def _analyze_single_frame(frame, prev_frame, frame_num, timestamp, query_data, m
             "bbox": best["bbox"],
             "text_content": None,
             "count": best.get("count"),
+            "track_id": best.get("track_id"),
+            "_match_tier": best.get("_match_tier"),
+            # tracked_ids_in_frame: all unique track IDs seen this frame
+            # (used by analyzer loop to aggregate unique_count)
+            "tracked_ids_in_frame": [
+                r["track_id"] for r in results if r.get("track_id") is not None
+            ] if use_tracking else [],
         }
 
     # ── Color only (no YOLO) ──

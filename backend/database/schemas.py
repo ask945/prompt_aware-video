@@ -82,6 +82,7 @@ class Job(Base):
     # Results
     result_found = Column(Boolean, default=False)
     confidence = Column(Float)
+    unique_count = Column(Integer, nullable=True)  # unique tracked objects for counting intent
 
     time_taken = Column(Float)
     error = Column(Text)                  # ← NEW: error message for failed jobs
@@ -113,6 +114,9 @@ class Detection(Base):
     bbox_y1 = Column(Integer)
     bbox_x2 = Column(Integer)
     bbox_y2 = Column(Integer)
+
+    count = Column(Integer)  # objects counted in this frame (for counting intent)
+    track_id = Column(Integer, nullable=True)  # ByteTrack ID for unique counting
 
     frame_url = Column(String)
     text_content = Column(Text)

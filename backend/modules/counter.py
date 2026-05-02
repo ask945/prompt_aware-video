@@ -30,6 +30,23 @@ def count(detections: list, target: str = None) -> int:
     return len(detections)
 
 
+def count_unique(detections: list) -> int:
+    """
+    Count unique tracked objects by track_id.
+
+    Args:
+        detections: list of detection dicts, each potentially with "track_id"
+                    (from yolo_detector.track())
+
+    Returns:
+        int — number of unique track IDs (None-valued IDs are ignored)
+    """
+    if not detections:
+        return 0
+    ids = {d["track_id"] for d in detections if d.get("track_id") is not None}
+    return len(ids)
+
+
 def count_with_details(detections: list, target: str = None) -> dict:
     """
     Count with breakdown by class.

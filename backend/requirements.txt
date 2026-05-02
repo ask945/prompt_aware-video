@@ -19,6 +19,7 @@ opencv-python-headless
 
 # Object detection
 ultralytics
+lap
 
 # OCR (pure Python — no system binary needed)
 easyocr

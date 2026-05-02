@@ -77,8 +77,10 @@ EARLY_STOP_RULES = {
     ("object_color", "specific"): (False, 0.0),
     ("object_color", "search"): (True, 0.85),
 
-    # OCR — stop once text is found
-    ("ocr", "full"):            (True, 0.70),
+    # OCR — scan all frames because different frames reveal different
+    # text regions (signs visible at different angles, occlusions changing).
+    # Only search scope early-stops since it's looking for FIRST appearance.
+    ("ocr", "full"):            (False, 0.0),
     ("ocr", "specific"):        (False, 0.0),
     ("ocr", "search"):          (True, 0.70),
 
